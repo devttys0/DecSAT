@@ -483,6 +483,8 @@ pub struct BganRx {
     load: f32,
     /// Frames' worth of wall-clock debt: positive when decoding lags.
     debt_s: f64,
+    /// A file decoded as fast as it can go: never shed work to keep up.
+    lossless: bool,
     tables_ok: Option<bool>,
     /// Drop the first symbols of the stream (filter/AGC transient).
     warm: bool,
@@ -510,6 +512,7 @@ impl BganRx {
             scratch0: BlockScratch::new(),
             load: 0.0,
             debt_s: 0.0,
+            lossless: false,
             tables_ok: None,
             warm: true,
             diag: false,
@@ -521,6 +524,14 @@ impl BganRx {
     /// rayon's global one.
     pub fn set_pool(&mut self, pool: Option<Arc<rayon::ThreadPool>>) {
         self.pool = pool;
+    }
+
+    /// Decode every frame in full however long it takes (a file read as
+    /// fast as possible, where falling behind real time costs nothing).
+    /// Otherwise frames are dropped, and fewer levels tried, when decoding
+    /// lags real time.
+    pub fn set_lossless(&mut self, on: bool) {
+        self.lossless = on;
     }
 
     /// Record, for every block that fails, the best any level could do. Slow;
@@ -860,6 +871,7 @@ impl BganRx {
                 out.push(fr[base + k] * sc * C32::new(c as f32, s as f32));
             }
         }
+        refine(&mut out);
         out
     }
 
@@ -907,13 +919,13 @@ impl BganRx {
             return out;
         }
         // Behind real time by more than ~1 s: shed work rather than queue it.
-        let behind = self.debt_s > 1.0;
+        let behind = !self.lossless && self.debt_s > 1.0;
         if behind {
             self.status.dropped_frames += 1;
             self.status.blocks_total -= 8;
             return out;
         }
-        let tight = self.debt_s > 0.3;
+        let tight = !self.lossless && self.debt_s > 0.3;
 
         // Block 0: the UW's level.
         let mut hints: Option<[Option<usize>; 8]> = None;
@@ -948,6 +960,15 @@ impl BganRx {
                 // one frame in 16 per block index tries every level
                 let explore = (index as usize + b).is_multiple_of(16);
                 let mut o = self.predictor.order(b, hint, explore);
+                // A level the AVP names is right 99.35 % of the time: when
+                // that one fails, the block was too weak for it. Trying the
+                // other levels was most of the CPU on real captures, where
+                // many blocks go at levels well above what a small dish
+                // receives, and on 120 s of two of them it rescued none of
+                // the ~6 000 blocks that failed at their named level.
+                if hints.and_then(|h| h[b]).is_some() {
+                    o.truncate(1);
+                }
                 if tight {
                     o.truncate(2);
                 }
@@ -1036,6 +1057,59 @@ impl BganRx {
     }
 }
 
+/// Turbo iterations at the level a block is expected at. Blocks near the
+/// threshold keep converging well past 8: on a real capture at Es/N0 ~5 dB,
+/// 182 of 3384 R blocks decoded at 16 iterations and 215 at 30. Early
+/// stopping ends most decodes long before.
+const EXPECTED_ITERS: usize = 30;
+
+/// Second pass of a block's carrier phase and level, from its own data
+/// symbols (`out` is [`BganRx::prepare`]'s, already pilot-corrected).
+///
+/// The 11 pilots are single symbols: at the Es/N0 of a small dish (~5 dB)
+/// their phase is good to ~0.3 rad each and their mean magnitude reads high,
+/// which costs 16-QAM a lot. The fourth power of 16-QAM has a mean of
+/// -0.68 (real), so a group's 136 data symbols give its phase to within the
+/// quarter turn the pilots already fixed: a block-wide estimate first, each
+/// group's taken nearest to it (not chained, so one noisy group cannot slip
+/// the rest by 90 degrees), and a least-squares line through those. The
+/// level comes from the second and fourth moments
+/// ([`fec::qam16_signal_power`]). On a real capture at ~5 dB this lifted
+/// L1 blocks from 426 to 570 of 585 and lost no L3 ones.
+fn refine(out: &mut [C32]) {
+    fn rotate(out: &mut [C32], phase: impl Fn(usize) -> f64) {
+        for (i, v) in out.iter_mut().enumerate() {
+            let (s, c) = (-phase(i)).sin_cos();
+            *v *= C32::new(c as f32, s as f32);
+        }
+    }
+    /// Phase of -sum(s^4) / 4: the data's carrier phase, modulo pi/2, in
+    /// (-pi/4, pi/4] (so nearest to what the pilots already removed).
+    fn quad_phase(s: &[C32]) -> f64 {
+        let z: C32 = s.iter().map(|v| (v * v) * (v * v)).sum();
+        f64::from((-z).im).atan2(f64::from((-z).re)) / 4.0
+    }
+    let block = quad_phase(out);
+    rotate(out, |_| block);
+    let g = DATA_PER_GROUP;
+    let n = out.len() / g;
+    let ph: Vec<f64> = (0..n)
+        .map(|k| quad_phase(&out[k * g..(k + 1) * g]))
+        .collect();
+    let xs: Vec<f64> = (0..n).map(|k| (k * g + g / 2) as f64).collect();
+    let nn = n as f64;
+    let (sx, sy) = (xs.iter().sum::<f64>(), ph.iter().sum::<f64>());
+    let sxx: f64 = xs.iter().map(|x| x * x).sum();
+    let sxy: f64 = xs.iter().zip(&ph).map(|(x, y)| x * y).sum();
+    let c1 = (nn * sxy - sx * sy) / (nn * sxx - sx * sx);
+    let c0 = (sy - c1 * sx) / nn;
+    rotate(out, |i| c0 + c1 * i as f64);
+    let k = (1.0 / fec::qam16_signal_power(out).sqrt()) as f32;
+    for v in out.iter_mut() {
+        *v *= k;
+    }
+}
+
 /// Trial-decode `sym` at each level in `order` until one is accepted. The
 /// first attempt at a level uses a short run of iterations (a wrong level
 /// never converges); a near miss is rerun at full length. Early stopping is
@@ -1052,7 +1126,7 @@ fn try_levels(
         };
         if rank == 0 {
             // the expected level: decode it properly straight away
-            let d = fec::decode_block(sc, sym, &t, 8);
+            let d = fec::decode_block(sc, sym, &t, if tight { 8 } else { EXPECTED_ITERS });
             if d.accepted() {
                 return Some((lv, d));
             }
@@ -1155,6 +1229,38 @@ mod tests {
             .map(|_| points[(rng.next_u32() as usize) % points.len()])
             .collect();
         impair(s, 0.0, esn0_db, &mut rng)
+    }
+
+    #[test]
+    fn refine_takes_out_phase_and_level() {
+        // a block at 5 dB, still 0.3 rad off and turning 0.4 mrad a symbol
+        // (more than the pilots' fit leaves), its level 20 % low
+        let n = F80T45X8B.teo;
+        let mut rng = Rng(11);
+        let clean: Vec<C32> = (0..n)
+            .map(|_| frame::qam16()[(rng.next_u32() % 16) as usize])
+            .collect();
+        let noisy = impair(clean.clone(), 0.0, 5.0, &mut rng);
+        let mut out: Vec<C32> = noisy
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let (s, c) = (0.3 + 4e-4 * i as f64 - 0.7).sin_cos();
+                v * C32::new(c as f32, s as f32) * 0.8
+            })
+            .collect();
+        refine(&mut out);
+        // what is left of the rotation, and the level, against the truth
+        let rot: C32 = out.iter().zip(&clean).map(|(o, c)| o * c.conj()).sum();
+        let resid = f64::from(rot.im).atan2(f64::from(rot.re));
+        let gain = out
+            .iter()
+            .zip(&clean)
+            .map(|(o, c)| (o * c.conj()).re)
+            .sum::<f32>()
+            / clean.iter().map(|c| c.norm_sqr()).sum::<f32>();
+        assert!(resid.abs() < 0.05, "phase left {resid}");
+        assert!((gain - 1.0).abs() < 0.05, "level {gain}");
     }
 
     #[test]

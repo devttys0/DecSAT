@@ -2290,6 +2290,7 @@ impl Worker {
                     }
                 }
                 b.set_live(self.bgan_wireshark.is_some());
+                b.set_lossless(self.lossless);
                 b.push(&self.bb);
                 if let Some(w) = &mut self.bgan_wireshark {
                     let now = std::time::SystemTime::now();
